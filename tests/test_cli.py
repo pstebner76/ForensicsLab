@@ -190,6 +190,67 @@ def test_triage_and_entropy_subcommands(tmp_path, capsys):
     assert payload[0]["Band"] == "low"
 
 
+def test_report_symlink_does_not_truncate_its_target(tmp_path, capsys):
+    evidence = tmp_path / "evidence.bin"
+    evidence.write_bytes(b"do-not-touch")
+    other = tmp_path / "other.txt"
+    other.write_bytes(ABC)
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "hash.csv").symlink_to(evidence)
+    code = main(["hash", "-f", str(other), "--csv", str(output)])
+    assert code == 2
+    assert "Refusing to write through symlink" in capsys.readouterr().err
+    assert evidence.read_bytes() == b"do-not-touch"
+    assert not (output / "hash.csv").is_file() or (output / "hash.csv").is_symlink()
+
+
+def test_report_name_that_is_the_evidence_file_is_refused(tmp_path, capsys):
+    folder = tmp_path / "case"
+    folder.mkdir()
+    evidence = folder / "hash.csv"
+    evidence.write_bytes(b"do-not-touch")
+    code = main(["hash", "-f", str(evidence), "--csv", str(folder)])
+    assert code == 2
+    assert "Refusing to overwrite evidence file" in capsys.readouterr().err
+    assert evidence.read_bytes() == b"do-not-touch"
+
+
+def test_unsearchable_directory_is_exit_1(tmp_path, capsys):
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("root ignores file mode bits")
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    hidden = secret / "hidden.txt"
+    hidden.write_bytes(ABC)
+    secret.chmod(0)
+    try:
+        code = main(["hash", "-f", str(hidden)])
+    finally:
+        secret.chmod(0o755)
+    assert code == 1
+    captured = capsys.readouterr()
+    assert ABC_SHA256 not in captured.out
+    assert captured.err.startswith("error:")
+
+
+def test_non_utf8_filename_is_exported_as_utf8(tmp_path):
+    name = os.fsdecode(b"bad\xff.bin")
+    target = tmp_path / name
+    try:
+        target.write_bytes(ABC)
+    except OSError:
+        pytest.skip("filesystem rejected a non-UTF-8 name")
+    output = tmp_path / "out"
+    assert main(["hash", "-f", str(target), "--csv", str(output), "--json", str(output)]) == 0
+    raw = (output / "hash.csv").read_bytes()
+    raw.decode("utf-8")
+    text = raw.decode("utf-8-sig")
+    assert "bad" in text
+    payload = json.loads((output / "hash.json").read_text(encoding="utf-8"))
+    assert payload[0]["SHA256"] == ABC_SHA256
+
+
 def test_unreadable_file_keeps_the_readable_sibling_and_exits_1(tmp_path, capsys):
     if not hasattr(os, "geteuid") or os.geteuid() == 0:
         pytest.skip("root ignores file mode bits")

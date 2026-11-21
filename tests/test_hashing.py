@@ -87,6 +87,14 @@ def test_hashing_does_not_change_bytes_mtime_or_ctime(tmp_path):
     assert after.st_mode == before.st_mode
 
 
+def test_fifo_open_fails_instead_of_blocking(tmp_path):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    reader = EvidenceReader()
+    with pytest.raises(OSError, match="Not a regular file"):
+        list(reader.chunks(fifo))
+
+
 def test_owned_linux_file_keeps_its_access_time(tmp_path):
     if not sys.platform.startswith("linux"):
         pytest.skip("O_NOATIME is a Linux flag")

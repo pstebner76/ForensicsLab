@@ -22,6 +22,7 @@ returns.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from forensicslab.evidence import (
     EvidenceReader,
     UsageError,
     prepare_output_directory,
+    refuse_output_alias,
     scan,
     validate_directory,
     validate_file,
@@ -166,6 +168,10 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except OSError as exc:
+        # stat or mkdir failed. The path may be valid and still unreadable.
+        print(f"error: {exc.strerror or exc}", file=sys.stderr)
+        return 1
 
     reader = EvidenceReader()
     if args.command == "hash":
@@ -191,29 +197,65 @@ def main(argv: list[str] | None = None) -> int:
     for note in found.notes:
         print(note, file=sys.stderr)
 
-    write_console(rows, fields)
-    # stdout is block-buffered when it is not a terminal. Flush before the
-    # stderr "Wrote" lines so the records stay above those lines in a log.
-    sys.stdout.flush()
+    try:
+        write_console(rows, fields)
+        # stdout is block-buffered when it is not a terminal. Flush before the
+        # stderr "Wrote" lines so the records stay above those lines in a log.
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # ``forensicslab hash -f a | head`` closes the pipe early. Without
+        # this handler Python prints a traceback during shutdown. Point
+        # stdout at devnull so that final flush has somewhere to go.
+        # The exit code is unchanged: a closed pipe is not a failed read.
+        _silence_stdout()
 
     write_failed = False
+    policy_refusal = False
     try:
+        if csv_dir is not None:
+            refuse_output_alias(csv_dir / f"{stem}.csv", found.files)
+        if json_dir is not None:
+            refuse_output_alias(json_dir / f"{stem}.json", found.files)
         if csv_dir is not None:
             written = write_csv(csv_dir, stem, rows, fields)
             print(f"Wrote {written}", file=sys.stderr)
         if json_dir is not None:
             written = write_json(json_dir, stem, rows, fields)
             print(f"Wrote {written}", file=sys.stderr)
+    except UsageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        policy_refusal = True
     except OSError as exc:
         print(f"error: Cannot write output: {exc.strerror or exc}", file=sys.stderr)
         write_failed = True
+    else:
+        policy_refusal = False
 
     errors = list(found.errors) + list(read_errors)
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
+    if policy_refusal:
+        return 2
     if write_failed or errors:
         return 1
     return 0
+
+
+def _silence_stdout() -> None:
+    """Replace stdout so a closed pipe does not raise again at shutdown."""
+
+    try:
+        sys.stdout.close()
+    except OSError:
+        pass
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(fd, 1)
+    finally:
+        os.close(fd)
 
 
 def console_main() -> None:

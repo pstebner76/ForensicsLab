@@ -13,6 +13,9 @@ policy of its own:
   directories explicitly so the skip is visible.
 - Refuse to create an output directory inside a directory the user
   passed with ``-d``. Results are not evidence and must not land in it.
+- Refuse to replace an evidence file, or to open a report path that is a
+  symlink. Reports are written to a new temp file and renamed into place,
+  so ``open(path, "w")`` never follows a link and truncates its target.
 
 Listing a directory can still update that directory's own access time.
 There is no portable flag that prevents it. File contents are never
@@ -89,7 +92,14 @@ def read_error_message(path: Path, exc: OSError) -> str:
 
 
 def validate_file(raw: str | Path) -> Path:
-    """Return the resolved path of one regular file the user named with ``-f``."""
+    """Return one regular file the user named with ``-f``.
+
+    The path is made absolute without :meth:`Path.resolve`. ``resolve``
+    follows a symlink in the final component, so a file that was replaced
+    by a link between the check and the resolve would be hashed anyway.
+    Ancestor symlinks are left alone: ``open`` follows them, and on macOS
+    ``/tmp`` itself is a symlink. Refusing those would reject normal paths.
+    """
 
     path = Path(raw).expanduser()
     info = _lstat_or_raise(path)
@@ -100,11 +110,15 @@ def validate_file(raw: str | Path) -> Path:
         )
     if not stat.S_ISREG(info.st_mode):
         raise UsageError(f"Not a regular file: {path}")
-    return path.resolve()
+    return _absolute_without_following(path)
 
 
 def validate_directory(raw: str | Path) -> Path:
-    """Return the resolved path of one directory the user named with ``-d``."""
+    """Return one directory the user named with ``-d``.
+
+    Same absolute-path rule as :func:`validate_file`: the final component
+    is not resolved through a symlink. Ancestor symlinks stay in the path.
+    """
 
     path = Path(raw).expanduser()
     info = _lstat_or_raise(path)
@@ -115,7 +129,7 @@ def validate_directory(raw: str | Path) -> Path:
         )
     if not stat.S_ISDIR(info.st_mode):
         raise UsageError(f"Not a directory: {path}")
-    return path.resolve()
+    return _absolute_without_following(path)
 
 
 def prepare_output_directory(raw: str | Path, evidence_directories: Sequence[Path]) -> Path:
@@ -137,25 +151,64 @@ def prepare_output_directory(raw: str | Path, evidence_directories: Sequence[Pat
             )
     if destination.exists() and not destination.is_dir():
         raise UsageError(f"Output path is not a directory: {destination}")
-    try:
-        destination.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise UsageError(
-            f"Cannot create output directory {destination}: {exc.strerror or exc}"
-        ) from exc
+    # A permission error here is an operational failure (exit 1), not a
+    # usage error. Callers let OSError propagate.
+    destination.mkdir(parents=True, exist_ok=True)
     return destination
+
+
+def refuse_output_alias(destination: Path, evidence_files: Sequence[Path]) -> None:
+    """Refuse a report path that would destroy or redirect onto evidence.
+
+    ``open(path, "w")`` follows a symlink and truncates whatever it points
+    at. ``os.replace`` on a hard link drops that link, and if it was the
+    only name of an evidence file the bytes are gone. Both are checked
+    before any report is published.
+
+    A missing report path is fine: the publish step creates a new file.
+    """
+
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise UsageError(
+            f"Refusing to write through symlink: {destination}. "
+            "Opening it would truncate the file the link points at."
+        )
+    for evidence in evidence_files:
+        try:
+            evidence_info = evidence.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(evidence_info.st_mode):
+            continue
+        same_file = (
+            info.st_dev == evidence_info.st_dev and info.st_ino == evidence_info.st_ino
+        )
+        if same_file:
+            raise UsageError(
+                f"Refusing to overwrite evidence file {destination}. "
+                "Choose a report name that is not one of the files being read."
+            )
 
 
 def scan(files: Sequence[Path], directories: Sequence[Path], *, recursive: bool) -> ScanResult:
     """Collect regular files, skipping symlinks and non-regular files.
 
     ``files`` and ``directories`` must already be validated. The same
-    resolved path is returned once, even if ``-f`` and ``-d`` both reach
+    absolute path is returned once, even if ``-f`` and ``-d`` both reach
     it. Hard links stay separate: two names can both matter in a listing,
     even when the bytes are the same inode.
 
+    Every path is held in memory so the report can be sorted. That fits a
+    case folder. A listing of a multi-terabyte image with tens of millions
+    of files wants a different tool that can spool to disk.
+
     Results are sorted so the same tree always produces the same CSV.
-    Filesystem order is not acquisition order, and it is not stable.
+    Paths that fold to the same letters are ordered by the raw path, so
+    ``B.txt`` and ``b.txt`` do not swap places between runs.
     """
 
     notes: list[str] = []
@@ -163,15 +216,26 @@ def scan(files: Sequence[Path], directories: Sequence[Path], *, recursive: bool)
     chosen: dict[str, Path] = {}
 
     def add(path: Path) -> None:
+        # lstat again here. The walk already skipped links, but the entry
+        # can be replaced by a symlink before we record it. resolve() would
+        # then follow that link. Record the absolute path of the entry we
+        # just checked, and let O_NOFOLLOW reject a later swap at open time.
         try:
-            resolved = path.resolve()
+            info = path.lstat()
         except OSError as exc:
             errors.append(f"Cannot stat {path}: {exc.strerror or exc}")
             return
+        if stat.S_ISLNK(info.st_mode):
+            errors.append(f"Refusing to follow symlink: {path}")
+            return
+        if not stat.S_ISREG(info.st_mode):
+            errors.append(f"Not a regular file: {path}")
+            return
+        absolute = _absolute_without_following(path)
         # normcase is a no-op on Linux and folds case on Windows, so the
         # same file is not listed twice when the only difference is case.
-        key = os.path.normcase(str(resolved))
-        chosen.setdefault(key, resolved)
+        key = os.path.normcase(str(absolute))
+        chosen.setdefault(key, absolute)
 
     for file in files:
         add(file)
@@ -179,7 +243,7 @@ def scan(files: Sequence[Path], directories: Sequence[Path], *, recursive: bool)
     for directory in directories:
         _scan_directory(directory, recursive=recursive, add=add, notes=notes, errors=errors)
 
-    ordered = sorted(chosen.values(), key=lambda path: os.path.normcase(str(path)).casefold())
+    ordered = sorted(chosen.values(), key=_sort_key)
     return ScanResult(tuple(ordered), tuple(notes), tuple(errors))
 
 
@@ -223,8 +287,34 @@ class EvidenceReader:
             handle.close()
 
 
+def _absolute_without_following(path: Path) -> Path:
+    """Absolute form of ``path`` that does not follow a final symlink.
+
+    ``os.path.abspath`` normalizes ``.`` and ``..`` lexically. It does not
+    call ``realpath``, so the last component is the name we lstat'd.
+    """
+
+    return Path(os.path.abspath(path))
+
+
+def _sort_key(path: Path) -> tuple[str, str]:
+    """Case-folded order, with the raw path as a tie-breaker.
+
+    On a case-sensitive disk, ``B.txt`` and ``b.txt`` fold to the same
+    letters. Sorting only by the folded form would keep whichever name
+    the filesystem returned first, and two runs could disagree.
+    """
+
+    text = os.path.normcase(str(path))
+    return (text.casefold(), text)
+
+
 def _lstat_or_raise(path: Path) -> os.stat_result:
-    """``lstat`` the path, or raise ``UsageError`` with the path the user typed.
+    """``lstat`` the path the user typed.
+
+    A missing path is a usage error: the argument does not name evidence.
+    Permission errors and other ``OSError``s stay ``OSError`` so the CLI
+    can exit 1. Those are failures while touching the disk, not bad flags.
 
     ``lstat`` does not follow a symlink, so a link can be reported as a
     link instead of as "no such file" or as whatever it points at.
@@ -234,8 +324,6 @@ def _lstat_or_raise(path: Path) -> os.stat_result:
         return path.lstat()
     except FileNotFoundError:
         raise UsageError(f"No such file: {path}") from None
-    except OSError as exc:
-        raise UsageError(f"Cannot stat {path}: {exc.strerror or exc}") from None
 
 
 def _is_inside(path: Path, parent: Path) -> bool:
@@ -257,26 +345,25 @@ def _scan_directory(directory: Path, *, recursive: bool, add, notes: list[str], 
     # prune below is still required. It is the supported way to stop a
     # descent, and it is where the skip is recorded for the analyst.
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False, onerror=onerror):
-        if not recursive:
-            # Slice assignment, not ``dirnames = []``. os.walk keeps the
-            # same list object and looks at it after this loop body. A
-            # plain assignment would only rebind the local name, and the
-            # walk would still descend.
-            dirnames[:] = []
-        else:
-            kept: list[str] = []
-            for name in dirnames:
-                candidate = Path(dirpath) / name
-                try:
-                    is_link = candidate.is_symlink()
-                except OSError as exc:
-                    errors.append(f"Cannot stat {candidate}: {exc.strerror or exc}")
-                    continue
-                if is_link:
-                    notes.append(f"Skipping symlink: {candidate}")
-                    continue
+        # Slice assignment, not ``dirnames = []``. os.walk keeps the same
+        # list object and looks at it after this loop body. A plain
+        # assignment would only rebind the local name, and the walk would
+        # still descend. Symlink directories are noted even when the user
+        # passed --no-recursive, so a skipped link is not silent.
+        kept: list[str] = []
+        for name in dirnames:
+            candidate = Path(dirpath) / name
+            try:
+                is_link = candidate.is_symlink()
+            except OSError as exc:
+                errors.append(f"Cannot stat {candidate}: {exc.strerror or exc}")
+                continue
+            if is_link:
+                notes.append(f"Skipping symlink: {candidate}")
+                continue
+            if recursive:
                 kept.append(name)
-            dirnames[:] = kept
+        dirnames[:] = kept
 
         for name in filenames:
             _consider_file(Path(dirpath) / name, add=add, notes=notes, errors=errors)
@@ -319,6 +406,11 @@ def _open_read_only(path: Path, *, follow_symlinks: bool) -> tuple[BinaryIO, boo
     """
 
     flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        # A FIFO swapped in after the lstat would otherwise block in open()
+        # until some other process writes to it. Non-blocking open returns
+        # immediately; fstat below rejects anything that is not a regular file.
+        flags |= os.O_NONBLOCK
     if hasattr(os, "O_BINARY"):
         # Windows text mode would translate bytes. Evidence hashes must see
         # the bytes on disk. POSIX Python ignores this flag; it is absent there.
@@ -332,15 +424,26 @@ def _open_read_only(path: Path, *, follow_symlinks: bool) -> tuple[BinaryIO, boo
     noatime = getattr(os, "O_NOATIME", 0)
     if noatime:
         try:
-            return _fdopen(os.open(path, flags | noatime)), True
+            return _opened_regular_file(os.open(path, flags | noatime)), True
         except OSError as exc:
             if exc.errno not in _NOATIME_REFUSED:
                 raise
-    return _fdopen(os.open(path, flags)), False
+    return _opened_regular_file(os.open(path, flags)), False
 
 
-def _fdopen(fd: int) -> BinaryIO:
+def _opened_regular_file(fd: int) -> BinaryIO:
+    """Return a binary file only after ``fstat`` says this fd is a regular file.
+
+    The check is on the descriptor, not the path. The path can change
+    between the earlier ``lstat`` and this ``open``; the descriptor cannot.
+    """
+
     try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EINVAL, "Not a regular file")
+        if hasattr(os, "set_blocking"):
+            os.set_blocking(fd, True)
         return os.fdopen(fd, "rb")
     except Exception:
         os.close(fd)

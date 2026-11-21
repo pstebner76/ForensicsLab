@@ -10,7 +10,8 @@ left as themselves.
 
 import csv
 import json
-from collections.abc import Mapping, Sequence
+import os
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 
@@ -23,7 +24,22 @@ def ordered_rows(
     cell that an examiner might trust.
     """
 
-    return [{field: row[field] for field in fields} for row in rows]
+    return [{field: _portable_text(row[field]) for field in fields} for row in rows]
+
+
+def _portable_text(value: object) -> object:
+    """Make a path safe to encode as UTF-8.
+
+    POSIX allows filenames that are not UTF-8. Python represents those
+    bytes as lone surrogates (``surrogateescape``). A strict UTF-8 encode
+    then raises ``UnicodeEncodeError`` and the export dies mid-file.
+    Round-tripping through ``surrogateescape`` and ``backslashreplace``
+    keeps the byte in the cell as ``\\xff`` and leaves real Unicode alone.
+    """
+
+    if not isinstance(value, str):
+        return value
+    return value.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
 
 
 def write_console(rows: Sequence[Mapping[str, object]], fields: Sequence[str]) -> None:
@@ -59,11 +75,13 @@ def write_csv(
 
     destination = directory / f"{stem}.csv"
     ordered = ordered_rows(rows, fields)
-    with destination.open("w", encoding="utf-8-sig", newline="") as handle:
+
+    def write(handle) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="raise")
         writer.writeheader()
         writer.writerows(ordered)
-    return destination
+
+    return _publish(directory, destination.name, "utf-8-sig", write)
 
 
 def write_json(
@@ -76,6 +94,46 @@ def write_json(
 
     destination = directory / f"{stem}.json"
     ordered = ordered_rows(rows, fields)
-    text = json.dumps(ordered, indent=2, ensure_ascii=False)
-    destination.write_text(text + "\n", encoding="utf-8")
+    text = json.dumps(ordered, indent=2, ensure_ascii=False) + "\n"
+
+    def write(handle) -> None:
+        handle.write(text)
+
+    return _publish(directory, destination.name, "utf-8", write)
+
+
+def _publish(directory: Path, name: str, encoding: str, write: Callable[[object], None]) -> Path:
+    """Write ``name`` via a new temp file, then rename it into place.
+
+    The temp file is created with ``O_EXCL`` and ``O_NOFOLLOW``, so a
+    symlink parked under the temp name is not followed and not truncated.
+    ``os.replace`` then swaps the directory entry. It does not open the
+    old path, so a symlink at ``name`` is replaced rather than followed.
+
+    Callers still refuse that symlink up front. Replacing it would drop
+    the link the analyst created, which is a surprising side effect even
+    though the target file would survive.
+    """
+
+    destination = directory / name
+    temporary = directory / f".{name}.{os.getpid()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(temporary, flags, 0o644)
+    try:
+        handle = os.fdopen(fd, "w", encoding=encoding, newline="")
+    except Exception:
+        os.close(fd)
+        temporary.unlink(missing_ok=True)
+        raise
+    try:
+        with handle:
+            write(handle)
+        os.replace(temporary, destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return destination

@@ -195,6 +195,19 @@ before you look inside it.
   `..` or a symlink that resolves inside that tree. A CSV written into the
   evidence tree would show up the next time you listed it. Writing next to
   a single `-f` file is allowed; prefer a separate `out/` directory anyway.
+  The report file itself is also refused when it is a symlink or the same
+  inode as a file being read, so `hash.csv` cannot be a link onto evidence
+  and cannot be the evidence file. The bytes are written to a new temp
+  file in the output directory and renamed into place.
+- A symlink in the last component of `-f` or `-d` is refused. A symlink in
+  an ancestor, such as macOS `/tmp`, is followed. That is ordinary path
+  lookup, and refusing it would reject normal paths.
+- The file list is kept in memory so the CSV can be sorted. That is the
+  right shape for a case folder, not for tens of millions of paths.
+- A filename that is not valid UTF-8 is written with backslash escapes
+  such as `\xff`, so the CSV stays valid UTF-8. A filename that starts
+  with `=` can be a formula if Excel opens the CSV. The tools do not
+  rewrite evidence names. Timeline Explorer does not evaluate formulas.
 - Listing a directory can still update that directory's own access time.
   There is no portable flag that prevents it.
 - MD5 and SHA-1 are identifiers for existing hash sets. They are not

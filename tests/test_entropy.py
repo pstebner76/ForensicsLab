@@ -34,6 +34,11 @@ def test_empty_and_constant_files_are_zero(tmp_path):
     assert tuple(empty_row) == ENTROPY_FIELDS
 
 
+def test_counts_must_match_the_reported_size():
+    with pytest.raises(ValueError):
+        shannon_entropy(Counter(b"aa"), 1)
+
+
 def test_two_equally_common_bytes_are_one_bit():
     counts = Counter(b"\x00\xff")
     assert shannon_entropy(counts, 2) == 1.0

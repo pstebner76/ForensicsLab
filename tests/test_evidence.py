@@ -42,6 +42,26 @@ def test_recursive_scan_sorts_and_skips_symlinks_and_fifos(tmp_path):
     assert result.errors == ()
 
 
+def test_case_only_differences_sort_by_the_raw_path(tmp_path):
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "b.txt").write_bytes(b"b")
+    (evidence / "B.txt").write_bytes(b"B")
+    result = scan([], [validate_directory(evidence)], recursive=True)
+    assert [path.name for path in result.files] == ["B.txt", "b.txt"]
+
+
+def test_no_recursive_still_notes_a_symlink_directory(tmp_path):
+    evidence = tmp_path / "evidence"
+    nested = evidence / "sub"
+    nested.mkdir(parents=True)
+    (evidence / "top.txt").write_bytes(b"top")
+    (evidence / "linkdir").symlink_to(nested, target_is_directory=True)
+    result = scan([], [validate_directory(evidence)], recursive=False)
+    assert [path.name for path in result.files] == ["top.txt"]
+    assert any("linkdir" in note for note in result.notes)
+
+
 def test_no_recursive_stays_in_the_top_directory(tmp_path):
     evidence = tmp_path / "evidence"
     (evidence / "sub").mkdir(parents=True)

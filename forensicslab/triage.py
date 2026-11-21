@@ -81,13 +81,31 @@ def split_ctime(ctime_ns: int, birth_ns: int | None, platform: str) -> tuple[str
     return metadata, creation
 
 
+def _birth_ns(info: os.stat_result) -> int | None:
+    """Return a birth time in nanoseconds, if this stat result has one.
+
+    The float fallback loses sub-nanosecond precision. It exists so a
+    build that only has ``st_birthtime`` still fills ``CreationTimeUtc``
+    instead of leaving a blank that looks like "no birth time".
+    """
+
+    birth_ns = getattr(info, "st_birthtime_ns", None)
+    if birth_ns is not None:
+        return int(birth_ns)
+    birth = getattr(info, "st_birthtime", None)
+    if birth is None:
+        return None
+    return int(birth * 1_000_000_000)
+
+
 def timestamps_from_stat(info: os.stat_result, platform: str | None = None) -> dict[str, str]:
     """Map one ``stat`` result onto the four timestamp columns."""
 
     system = sys.platform if platform is None else platform
-    birth_ns = None
-    if system != "win32":
-        birth_ns = getattr(info, "st_birthtime_ns", None)
+    # CPython on Windows documents st_ctime as creation time and does not
+    # offer a separate birth field. Other platforms may expose st_birthtime_ns
+    # or, on older builds, only the float st_birthtime.
+    birth_ns = None if system == "win32" else _birth_ns(info)
     metadata, creation = split_ctime(info.st_ctime_ns, birth_ns, system)
     return {
         "ModifiedTimeUtc": format_timestamp_ns(info.st_mtime_ns),
@@ -143,4 +161,8 @@ def triage_paths(paths: list[Path]) -> tuple[list[dict[str, object]], list[str]]
             rows.append(triage_file(path).as_row())
         except OSError as exc:
             errors.append(read_error_message(path, exc))
+        except (OverflowError, ValueError) as exc:
+            # datetime.fromtimestamp rejects timestamps far outside the
+            # range it can represent. One odd file should not abort the rest.
+            errors.append(f"Cannot format timestamps for {path}: {exc}")
     return rows, errors

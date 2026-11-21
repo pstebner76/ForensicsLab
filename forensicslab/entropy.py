@@ -47,6 +47,11 @@ def shannon_entropy(counts: Counter[int], total: int) -> float:
 
     if total <= 0:
         return 0.0
+    counted = sum(counts.values())
+    if counted != total:
+        raise ValueError(
+            f"byte counts add up to {counted}, not the reported size {total}"
+        )
     entropy = 0.0
     for count in counts.values():
         if count <= 0:
