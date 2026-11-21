@@ -1,0 +1,41 @@
+# Run the suite on every push and pull request. The tools have no
+# third-party runtime dependencies; pytest is installed from the dev extra.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package and pytest
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Run every subcommand
+        run: |
+          printf '%s' abc > abc.txt
+          forensicslab hash -f abc.txt
+          forensicslab triage -f abc.txt
+          forensicslab entropy -f abc.txt
+          test "$(python triage.py abc.txt)" = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
