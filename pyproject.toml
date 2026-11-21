@@ -1,0 +1,41 @@
+# forensicslab installs as a console script. The tools depend only on the
+# Python standard library. pytest is a development extra, not a runtime one.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forensicslab"
+version = "0.1.0"
+description = "Read-only DFIR command-line tools: hashing, file triage, and Shannon entropy."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Patrice Stebner" }]
+keywords = ["dfir", "forensics", "hashing", "entropy"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+forensicslab = "forensicslab.cli:console_main"
+
+[tool.setuptools.packages.find]
+include = ["forensicslab*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
